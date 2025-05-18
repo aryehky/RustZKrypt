@@ -4,6 +4,7 @@ use std::{
     io::{Read, Write},
     path::Path,
     sync::{Arc, RwLock},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use aes_gcm::{
@@ -133,12 +134,84 @@ impl KeyStore {
         *self.keys.write().unwrap() = keys;
         Ok(())
     }
+
+    /// Rotate a key in the keystore
+    pub fn rotate_key(&self, id: &str) -> Result<()> {
+        let master_key = self.master_key.as_ref()
+            .ok_or_else(|| crate::Error::Crypto("Master key not set".into()))?;
+            
+        let (old_key, mut metadata) = self.get_key(id)?;
+        
+        // Generate new key with same length
+        let new_key = SecureKey::new(old_key.as_bytes().len());
+        
+        // Update metadata
+        metadata.created_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+            
+        // Store new key
+        self.store_key(id, &new_key, metadata)?;
+        
+        Ok(())
+    }
+
+    /// Create an encrypted backup of the keystore
+    pub fn create_backup<P: AsRef<Path>>(&self, backup_path: P, backup_key: &[u8]) -> Result<()> {
+        let keys = self.keys.read().unwrap();
+        let json = serde_json::to_string(&*keys)
+            .map_err(|e| crate::Error::Crypto(e.to_string()))?;
+            
+        // Encrypt backup with separate key
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(backup_key));
+        let nonce = Aes256Gcm::generate_nonce(&mut rand::thread_rng());
+        
+        let mut encrypted = cipher
+            .encrypt(&nonce, json.as_bytes())
+            .map_err(|e| crate::Error::Crypto(e.to_string()))?;
+            
+        // Prepend nonce to encrypted data
+        let mut backup_data = nonce.to_vec();
+        backup_data.append(&mut encrypted);
+        
+        let mut file = File::create(backup_path)
+            .map_err(|e| crate::Error::Io(e))?;
+        file.write_all(&backup_data)
+            .map_err(|e| crate::Error::Io(e))?;
+            
+        Ok(())
+    }
+
+    /// Restore keystore from an encrypted backup
+    pub fn restore_from_backup<P: AsRef<Path>>(&mut self, backup_path: P, backup_key: &[u8]) -> Result<()> {
+        let mut file = File::open(backup_path)
+            .map_err(|e| crate::Error::Io(e))?;
+            
+        let mut backup_data = Vec::new();
+        file.read_to_end(&mut backup_data)
+            .map_err(|e| crate::Error::Io(e))?;
+            
+        // Split nonce and ciphertext
+        let (nonce, ciphertext) = backup_data.split_at(12);
+        
+        // Decrypt backup
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(backup_key));
+        let json = cipher
+            .decrypt(nonce.into(), ciphertext)
+            .map_err(|e| crate::Error::Crypto(e.to_string()))?;
+            
+        let keys: HashMap<String, EncryptedKey> = serde_json::from_slice(&json)
+            .map_err(|e| crate::Error::Crypto(e.to_string()))?;
+            
+        *self.keys.write().unwrap() = keys;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn test_keystore() {
@@ -172,6 +245,68 @@ mod tests {
         
         let (retrieved_key2, _) = new_store.get_key("test-key").unwrap();
         assert_eq!(key.as_bytes(), retrieved_key2.as_bytes());
+        
+        fs::remove_file(temp_path).unwrap();
+    }
+
+    #[test]
+    fn test_key_rotation() {
+        let master_key = b"master password";
+        let store = KeyStore::new(master_key);
+        
+        let key = SecureKey::new(32);
+        let metadata = KeyMetadata {
+            id: "rotate-test".into(),
+            key_type: "aes".into(),
+            created_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            description: Some("Test key".into()),
+        };
+        
+        // Store initial key
+        store.store_key("rotate-test", &key, metadata.clone()).unwrap();
+        let (old_key, _) = store.get_key("rotate-test").unwrap();
+        
+        // Rotate key
+        store.rotate_key("rotate-test").unwrap();
+        let (new_key, new_metadata) = store.get_key("rotate-test").unwrap();
+        
+        assert_ne!(old_key.as_bytes(), new_key.as_bytes());
+        assert!(new_metadata.created_at > metadata.created_at);
+    }
+
+    #[test]
+    fn test_backup_restore() {
+        let master_key = b"master password";
+        let backup_key = b"backup password";
+        let store = KeyStore::new(master_key);
+        
+        // Store a test key
+        let key = SecureKey::new(32);
+        let metadata = KeyMetadata {
+            id: "backup-test".into(),
+            key_type: "aes".into(),
+            created_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            description: Some("Test key".into()),
+        };
+        
+        store.store_key("backup-test", &key, metadata).unwrap();
+        
+        // Create backup
+        let temp_path = "test_backup.bin";
+        store.create_backup(temp_path, backup_key).unwrap();
+        
+        // Restore to new store
+        let mut new_store = KeyStore::new(master_key);
+        new_store.restore_from_backup(temp_path, backup_key).unwrap();
+        
+        let (restored_key, _) = new_store.get_key("backup-test").unwrap();
+        assert_eq!(key.as_bytes(), restored_key.as_bytes());
         
         fs::remove_file(temp_path).unwrap();
     }
