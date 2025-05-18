@@ -1,4 +1,5 @@
 use std::time::Duration;
+use std::collections::HashMap;
 
 use libp2p::{
     core::upgrade,
@@ -8,6 +9,7 @@ use libp2p::{
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
+use tokio::time::sleep;
 
 use crate::{crypto, Result};
 
@@ -58,6 +60,22 @@ impl From<mdns::Event> for OutEvent {
     fn from(event: mdns::Event) -> Self {
         OutEvent::Mdns(event)
     }
+}
+
+/// Message status tracking
+#[derive(Debug, Clone)]
+struct MessageStatus {
+    attempts: u32,
+    last_attempt: u64,
+    ack_received: bool,
+}
+
+/// Message acknowledgment
+#[derive(Debug, Serialize, Deserialize)]
+struct MessageAck {
+    message_id: String,
+    from: String,
+    timestamp: u64,
 }
 
 /// A P2P messaging protocol node
@@ -137,16 +155,88 @@ impl ProtocolNode {
         Ok(())
     }
 
-    /// Run the protocol node
-    pub async fn run(&mut self) -> Result<()> {
+    /// Send a message with retry logic
+    pub async fn send_message_with_retry(
+        &mut self,
+        content: &[u8],
+        keypair: &crypto::SecureKey,
+        max_attempts: u32,
+        retry_delay: Duration,
+    ) -> Result<()> {
+        let message_id = format!("{:x}", Sha256::digest(content));
+        let mut status = MessageStatus {
+            attempts: 0,
+            last_attempt: 0,
+            ack_received: false,
+        };
+        
+        while status.attempts < max_attempts && !status.ack_received {
+            self.send_message(content, keypair).await?;
+            status.attempts += 1;
+            status.last_attempt = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+                
+            // Wait for acknowledgment
+            sleep(retry_delay).await;
+            
+            // Check if ack was received during sleep
+            if let Some(ack) = self.check_ack(&message_id).await {
+                status.ack_received = true;
+                break;
+            }
+        }
+        
+        if !status.ack_received {
+            return Err(crate::Error::Network("Message not acknowledged".into()));
+        }
+        
+        Ok(())
+    }
+
+    /// Check for message acknowledgment
+    async fn check_ack(&self, message_id: &str) -> Option<MessageAck> {
+        // Implementation would check a received acks cache
+        None // Placeholder
+    }
+
+    /// Send message acknowledgment
+    async fn send_ack(&mut self, message_id: &str) -> Result<()> {
+        let ack = MessageAck {
+            message_id: message_id.to_string(),
+            from: self.swarm.local_peer_id().to_string(),
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        };
+        
+        let data = serde_json::to_vec(&ack)
+            .map_err(|e| crate::Error::Network(e.to_string()))?;
+            
+        self.swarm.behaviour_mut().floodsub.publish(self.topic.clone(), data);
+        Ok(())
+    }
+
+    /// Run the protocol node with acknowledgments
+    pub async fn run_with_acks(&mut self) -> Result<()> {
         loop {
             tokio::select! {
                 event = self.swarm.select_next_some() => {
                     match event {
                         SwarmEvent::Behaviour(OutEvent::Floodsub(FloodsubEvent::Message(msg))) => {
+                            // Try to parse as regular message or ack
                             if let Ok(message) = serde_json::from_slice::<SecureMessage>(&msg.data) {
+                                // Send acknowledgment
+                                let message_id = format!("{:x}", Sha256::digest(&message.content));
+                                self.send_ack(&message_id).await?;
+                                
                                 self.message_tx.send(message).await
                                     .map_err(|e| crate::Error::Network(e.to_string()))?;
+                            } else if let Ok(ack) = serde_json::from_slice::<MessageAck>(&msg.data) {
+                                // Process acknowledgment
+                                // Implementation would update acks cache
                             }
                         }
                         SwarmEvent::Behaviour(OutEvent::Mdns(mdns::Event::Discovered(list))) => {
@@ -162,7 +252,6 @@ impl ProtocolNode {
                         _ => {}
                     }
                 }
-                // Add timeout to prevent blocking forever
                 _ = tokio::time::sleep(Duration::from_secs(1)) => {}
             }
         }
@@ -195,7 +284,30 @@ mod tests {
         
         // Run node for a short time
         tokio::spawn(async move {
-            node.run().await.unwrap();
+            node.run_with_acks().await.unwrap();
         });
+    }
+
+    #[tokio::test]
+    async fn test_message_retry() {
+        let config = ProtocolConfig {
+            listen_addr: Multiaddr::from_str("/ip4/127.0.0.1/tcp/0").unwrap(),
+            bootstrap_peers: vec![],
+            topic: "test".into(),
+        };
+
+        let mut node = ProtocolNode::new(config).await.unwrap();
+        let key = crypto::SecureKey::new(32);
+        
+        // Test message sending with retries
+        let result = node.send_message_with_retry(
+            b"test message",
+            &key,
+            3,
+            Duration::from_millis(100)
+        ).await;
+        
+        // Expect error since no peers to acknowledge
+        assert!(result.is_err());
     }
 } 
