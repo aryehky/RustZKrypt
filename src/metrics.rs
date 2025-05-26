@@ -6,6 +6,59 @@ use std::{
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
+/// Histogram for tracking value distributions
+#[derive(Debug, Clone, Default)]
+struct Histogram {
+    buckets: Vec<u64>,
+    min: f64,
+    max: f64,
+    sum: f64,
+    count: u64,
+}
+
+impl Histogram {
+    fn new(bucket_count: usize) -> Self {
+        Self {
+            buckets: vec![0; bucket_count],
+            min: f64::MAX,
+            max: f64::MIN,
+            sum: 0.0,
+            count: 0,
+        }
+    }
+
+    fn record(&mut self, value: f64) {
+        self.min = self.min.min(value);
+        self.max = self.max.max(value);
+        self.sum += value;
+        self.count += 1;
+
+        let bucket_index = (value / self.max * (self.buckets.len() - 1) as f64) as usize;
+        if bucket_index < self.buckets.len() {
+            self.buckets[bucket_index] += 1;
+        }
+    }
+
+    fn percentile(&self, p: f64) -> Option<f64> {
+        if self.count == 0 {
+            return None;
+        }
+
+        let target_count = (self.count as f64 * p) as u64;
+        let mut current_count = 0;
+        
+        for (i, &count) in self.buckets.iter().enumerate() {
+            current_count += count;
+            if current_count >= target_count {
+                let bucket_size = self.max / self.buckets.len() as f64;
+                return Some(i as f64 * bucket_size);
+            }
+        }
+        
+        Some(self.max)
+    }
+}
+
 /// Metrics collection for RustZkrypt
 #[derive(Debug, Clone, Default)]
 pub struct Metrics {
@@ -15,6 +68,8 @@ pub struct Metrics {
     timings: Arc<RwLock<HashMap<String, Vec<Duration>>>>,
     /// Error counts
     errors: Arc<RwLock<HashMap<String, u64>>>,
+    /// Histograms for value distributions
+    histograms: Arc<RwLock<HashMap<String, Histogram>>>,
     /// Start time of the metrics collection
     start_time: Instant,
 }
@@ -28,8 +83,21 @@ pub struct MetricsSnapshot {
     pub avg_timings: HashMap<String, Duration>,
     /// Error counts
     pub errors: HashMap<String, u64>,
+    /// Histogram statistics
+    pub histograms: HashMap<String, HistogramStats>,
     /// Uptime in seconds
     pub uptime: u64,
+}
+
+/// Statistics for histogram data
+#[derive(Debug, Serialize, Deserialize)]
+pub struct HistogramStats {
+    pub min: f64,
+    pub max: f64,
+    pub avg: f64,
+    pub p50: f64,
+    pub p95: f64,
+    pub p99: f64,
 }
 
 impl Metrics {
@@ -39,6 +107,7 @@ impl Metrics {
             counters: Arc::new(RwLock::new(HashMap::new())),
             timings: Arc::new(RwLock::new(HashMap::new())),
             errors: Arc::new(RwLock::new(HashMap::new())),
+            histograms: Arc::new(RwLock::new(HashMap::new())),
             start_time: Instant::now(),
         }
     }
@@ -65,6 +134,15 @@ impl Metrics {
         warn!("Error recorded for operation: {}", name);
     }
 
+    /// Record a value in a histogram
+    pub fn record_histogram(&self, name: &str, value: f64) {
+        let mut histograms = self.histograms.write().unwrap();
+        let histogram = histograms
+            .entry(name.to_string())
+            .or_insert_with(|| Histogram::new(100));
+        histogram.record(value);
+    }
+
     /// Get current metrics snapshot
     pub fn snapshot(&self) -> MetricsSnapshot {
         let counters = self.counters.read().unwrap().clone();
@@ -80,11 +158,29 @@ impl Metrics {
                 avg_timings.insert(name.clone(), avg);
             }
         }
+
+        // Calculate histogram statistics
+        let mut histogram_stats = HashMap::new();
+        let histograms = self.histograms.read().unwrap();
+        
+        for (name, histogram) in histograms.iter() {
+            if histogram.count > 0 {
+                histogram_stats.insert(name.clone(), HistogramStats {
+                    min: histogram.min,
+                    max: histogram.max,
+                    avg: histogram.sum / histogram.count as f64,
+                    p50: histogram.percentile(0.5).unwrap_or(0.0),
+                    p95: histogram.percentile(0.95).unwrap_or(0.0),
+                    p99: histogram.percentile(0.99).unwrap_or(0.0),
+                });
+            }
+        }
         
         MetricsSnapshot {
             counters,
             avg_timings,
             errors,
+            histograms: histogram_stats,
             uptime: self.start_time.elapsed().as_secs(),
         }
     }
@@ -94,6 +190,7 @@ impl Metrics {
         *self.counters.write().unwrap() = HashMap::new();
         *self.timings.write().unwrap() = HashMap::new();
         *self.errors.write().unwrap() = HashMap::new();
+        *self.histograms.write().unwrap() = HashMap::new();
         info!("Metrics reset");
     }
 
@@ -170,5 +267,25 @@ mod tests {
         assert_eq!(metrics.snapshot().counters["thread_op"], 4);
         assert_eq!(metrics.snapshot().errors["thread_op"], 2);
         assert_eq!(metrics.success_rate("thread_op"), 0.5);
+    }
+
+    #[test]
+    fn test_histogram_metrics() {
+        let metrics = Metrics::new();
+        
+        // Record some values
+        metrics.record_histogram("test_hist", 10.0);
+        metrics.record_histogram("test_hist", 20.0);
+        metrics.record_histogram("test_hist", 30.0);
+        
+        let snapshot = metrics.snapshot();
+        let stats = &snapshot.histograms["test_hist"];
+        
+        assert_eq!(stats.min, 10.0);
+        assert_eq!(stats.max, 30.0);
+        assert_eq!(stats.avg, 20.0);
+        assert!(stats.p50 > 0.0);
+        assert!(stats.p95 > 0.0);
+        assert!(stats.p99 > 0.0);
     }
 } 
