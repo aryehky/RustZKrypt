@@ -5,6 +5,7 @@
 #![warn(missing_docs)]
 
 pub mod crypto;
+pub mod metrics;
 pub mod zk;
 pub mod net;
 
@@ -60,6 +61,17 @@ pub fn init(config: Config) -> Result<()> {
     zk::init(&config.zk)?;
     net::init(&config.network)?;
     Ok(())
+}
+
+pub use crypto::threshold;
+pub use crypto::zkp;
+pub use metrics::Metrics;
+
+/// Re-export commonly used types
+pub mod prelude {
+    pub use crate::crypto::threshold::{ThresholdScheme, KeyShare};
+    pub use crate::crypto::zkp::{ZKP, ZKProof};
+    pub use crate::metrics::Metrics;
 }
 
 #[cfg(test)]
